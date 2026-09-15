@@ -1,0 +1,29 @@
+# ---------------------------------------------------------------------------
+# This repo tracks the SCRIPTS only - never the photos.
+#
+# The library can be 100+ GB. Git would try to store every byte, forever, and
+# would be a catastrophic way to back up photos. Your actual backup is the
+# BackupPath mirror in config.json plus an external/offsite copy.
+# ---------------------------------------------------------------------------
+
+# The photo library itself
+Library/
+Groups/
+.staging/
+
+# Derived state: rebuildable, and large (catalog.jsonl is ~10 MB at 20k photos)
+state/
+logs/
+
+# Third-party binary, fetched separately (see README)
+tools/
+
+# config.json IS tracked - it holds no secrets, just your paths and options,
+# and having it versioned means you can undo a bad settings change.
+
+# Windows noise
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk

@@ -1,0 +1,3 @@
+# Windows-only project: .cmd in particular misbehaves with LF endings.
+* text=auto eol=crlf
+*.png binary
