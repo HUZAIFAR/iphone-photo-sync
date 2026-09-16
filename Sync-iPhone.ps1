@@ -250,23 +250,44 @@ function Test-DeviceStillThere {
     return $false
 }
 
+function Resolve-StagedFile {
+    <#
+        Finds what the shell actually wrote for an item called $Name.
+
+        Windows appends the true extension while copying over MTP, so an item the
+        phone lists as "FKTC3180" lands as FKTC3180.JPEG - and the extension it
+        picks is not predictable (the same photo has arrived as both .JPG and
+        .JPEG). Waiting on the literal name therefore never succeeded and every
+        file timed out. Match on the base name instead.
+    #>
+    param([string]$StageDir, [string]$Name)
+    $exact = Join-Path $StageDir $Name
+    if (Test-Path -LiteralPath $exact -PathType Leaf) { return $exact }
+    $hit = Get-ChildItem -LiteralPath $StageDir -File -Filter ($Name + '.*') -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if ($hit) { return $hit.FullName }
+    return $null
+}
+
 function Wait-ForStagedFile {
-    param([string]$Path, [long]$ExpectedSize, [int]$TimeoutSec = 240)
+    # Returns the resolved path once the file has fully landed, else $null.
+    param([string]$StageDir, [string]$Name, [long]$ExpectedSize, [int]$TimeoutSec = 240)
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $lastLen  = -1
     $stable   = 0
     while ((Get-Date) -lt $deadline) {
-        if (Test-Path -LiteralPath $Path) {
-            $len = (Get-Item -LiteralPath $Path).Length
+        $p = Resolve-StagedFile -StageDir $StageDir -Name $Name
+        if ($p) {
+            $len = (Get-Item -LiteralPath $p).Length
             if ($len -eq $lastLen -and ($ExpectedSize -le 0 -or $len -eq $ExpectedSize)) {
                 $stable++
-                if ($stable -ge 2) { return $true }
+                if ($stable -ge 2) { return $p }
             } else { $stable = 0 }
             $lastLen = $len
         }
         Start-Sleep -Milliseconds 150
     }
-    return $false
+    return $null
 }
 
 # ------------------------------------------------------------------ index ---
@@ -469,9 +490,9 @@ try {
 
             $chunkTimeouts = 0
             foreach ($e in $slice) {
-                $sp = Join-Path $StageDir $e.Name
                 Set-Status @{ CurrentFile = $e.Name; Album = $e.Album }
-                if (Wait-ForStagedFile -Path $sp -ExpectedSize $e.Size) {
+                $sp = Wait-ForStagedFile -StageDir $StageDir -Name $e.Name -ExpectedSize $e.Size
+                if ($sp) {
                     $r = Complete-StagedFile -StagedPath $sp -Key $e.Key -ExpectedSize $e.Size -Album $e.Album
                     if ($null -ne $r) {
                         $copied++; $bytes += $r; [void]$index.Add($e.Key)
@@ -479,7 +500,8 @@ try {
                 } else {
                     Write-Log ("  timed out copying {0} - will retry next run." -f $e.Name) 'WARN'
                     $failed++; $chunkTimeouts++
-                    Remove-Item -LiteralPath $sp -Force -ErrorAction SilentlyContinue
+                    $orphan = Resolve-StagedFile -StageDir $StageDir -Name $e.Name
+                    if ($orphan) { Remove-Item -LiteralPath $orphan -Force -ErrorAction SilentlyContinue }
                 }
                 Set-Status @{ Done = $copied; Failed = $failed; Bytes = $bytes
                               CurrentDate = $script:LastBucket }
