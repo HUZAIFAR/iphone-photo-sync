@@ -183,7 +183,17 @@ function Get-SubFolder {
 }
 
 function Get-DeviceDcim {
-    # Returns the DCIM Folder COM object, or $null if the device is absent/locked.
+    <#
+        Returns the folder whose SUBFOLDERS hold the camera roll, or $null when
+        the device is absent or still locked.
+
+        iPhones present two different layouts over MTP:
+          classic   Internal Storage\DCIM\100APPLE\IMG_0001.HEIC
+          bucketed  Internal Storage\202403_a\ARQM0324     (no DCIM level at all,
+                    month-bucketed folder names, and no file extensions)
+        Only handling the first one made the second look identical to "phone is
+        locked", because no folder called DCIM ever turned up.
+    #>
     $thisPC = $shell.NameSpace(17)
     if (-not $thisPC) { return $null }
     foreach ($dev in $thisPC.Items()) {
@@ -191,7 +201,8 @@ function Get-DeviceDcim {
         if ($dev.Name -notmatch $cfg.DeviceNamePattern) { continue }
         $devFolder = $dev.GetFolder
         if (-not $devFolder) { continue }
-        # DCIM sits either at the device root or one level down ("Internal Storage").
+
+        # The device root plus each storage below it ("Internal Storage").
         $candidates = New-Object System.Collections.ArrayList
         [void]$candidates.Add($devFolder)
         try {
@@ -199,12 +210,30 @@ function Get-DeviceDcim {
                 if ($sub.IsFolder) { [void]$candidates.Add($sub.GetFolder) }
             }
         } catch { }
+
+        # 1. Classic layout wins if a real DCIM exists.
         foreach ($store in $candidates) {
             $dcim = Get-SubFolder $store '^DCIM$'
             if ($dcim) {
-                $script:DeviceLabel = $dev.Name
+                $script:DeviceLabel  = $dev.Name
+                $script:DeviceLayout = 'DCIM'
                 return $dcim
             }
+        }
+
+        # 2. Otherwise look for media-shaped buckets: 202403_a or 100APPLE.
+        foreach ($store in $candidates) {
+            try {
+                $subs = @($store.Items() | Where-Object { $_.IsFolder })
+                $mediaish = @($subs | Where-Object {
+                    $_.Name -match '^\d{6}_[A-Za-z]$' -or $_.Name -match '^\d{3}[A-Z]{3,6}$'
+                })
+                if ($mediaish.Count -ge 1) {
+                    $script:DeviceLabel  = $dev.Name
+                    $script:DeviceLayout = 'bucketed'
+                    return $store
+                }
+            } catch { }
         }
     }
     return $null
@@ -272,6 +301,14 @@ function Complete-StagedFile {
         Remove-Item -LiteralPath $StagedPath -Force -ErrorAction SilentlyContinue
         return $null
     }
+    # Some iPhones hand over names with no extension at all ("ARQM0324"). Sniff
+    # the real type from the file header so what lands on disk is openable.
+    $outName = $fi.Name
+    if (-not [IO.Path]::GetExtension($outName)) {
+        $sniffed = Get-ExtensionFromContent -Path $StagedPath
+        if ($sniffed) { $outName = $outName + $sniffed }
+    }
+
     $stamp = $fi.LastWriteTime
     if ($stamp.Year -lt 2000 -or $stamp -gt (Get-Date).AddDays(2)) { $stamp = Get-Date }
     $bucket = '{0}-{1:00}' -f $stamp.Year, $stamp.Month
@@ -283,7 +320,7 @@ function Complete-StagedFile {
     }
     if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
 
-    $dest = Get-UniqueDest -Dir $destDir -Name $fi.Name -Size $fi.Length
+    $dest = Get-UniqueDest -Dir $destDir -Name $outName -Size $fi.Length
     $script:LastBucket = $bucket
     if ($null -eq $dest) {
         Remove-Item -LiteralPath $StagedPath -Force -ErrorAction SilentlyContinue

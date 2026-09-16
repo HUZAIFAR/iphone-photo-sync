@@ -98,14 +98,29 @@ while ($true) {
         }
         $wasPresent = $present
 
+        # Report a finished sync without having blocked on it.
+        if ($script:SyncProc -and $script:SyncProc.HasExited) {
+            Write-WLog ('Sync finished (exit {0}).' -f $script:SyncProc.ExitCode)
+            $script:SyncProc = $null
+        }
+
         if ($present -and -not $syncedThis) {
             # Give Windows a moment to finish mounting the MTP store.
             Start-Sleep -Seconds 3
             Write-WLog 'Starting sync (will wait for unlock if needed).'
             $syncedThis = $true
             try {
-                & $syncScript -ConfigPath $ConfigPath -FromWatcher 4>&1 5>&1 | Out-Null
-                Write-WLog 'Sync finished.'
+                # Launched as its own process, NOT called inline. Running it inline
+                # froze this polling loop for the whole sync, so the heartbeat in
+                # device.json went stale and the dashboard showed "Auto-sync off"
+                # during the one time it mattered most. Staying responsive also
+                # means we keep noticing the phone being unplugged.
+                $script:SyncProc = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList @(
+                    '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+                    '-File', ('"{0}"' -f $syncScript),
+                    '-ConfigPath', ('"{0}"' -f $ConfigPath),
+                    '-FromWatcher'
+                )
             } catch {
                 Write-WLog ('Sync error: ' + $_.Exception.Message)
             }

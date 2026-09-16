@@ -57,6 +57,43 @@ function Get-FileSha256 {
 $script:ImageExt = @('.heic','.heif','.jpg','.jpeg','.png','.dng','.tif','.tiff','.gif','.webp','.bmp','.avif')
 $script:VideoExt = @('.mov','.mp4','.m4v','.avi','.hevc')
 
+function Get-ExtensionFromContent {
+    <#
+        Works out a file's real type by reading its magic bytes.
+
+        Needed because some iPhones expose the camera roll over MTP with NO file
+        extensions at all (names like "ARQM0324"). Copying those through as-is
+        produces files Windows cannot open or thumbnail, so we sniff the header
+        and append the correct extension. Returns '' if unrecognised, in which
+        case the name is left exactly as the phone gave it.
+    #>
+    param([string]$Path)
+    try {
+        $b = New-Object byte[] 16
+        $fs = [IO.File]::OpenRead($Path)
+        try { $n = $fs.Read($b, 0, 16) } finally { $fs.Dispose() }
+        if ($n -lt 12) { return '' }
+
+        if ($b[0] -eq 0xFF -and $b[1] -eq 0xD8 -and $b[2] -eq 0xFF) { return '.jpg' }
+        if ($b[0] -eq 0x89 -and $b[1] -eq 0x50 -and $b[2] -eq 0x4E -and $b[3] -eq 0x47) { return '.png' }
+        if ($b[0] -eq 0x47 -and $b[1] -eq 0x49 -and $b[2] -eq 0x46) { return '.gif' }
+        if (($b[0] -eq 0x49 -and $b[1] -eq 0x49 -and $b[2] -eq 0x2A) -or
+            ($b[0] -eq 0x4D -and $b[1] -eq 0x4D -and $b[3] -eq 0x2A)) { return '.tif' }
+        if ($b[0] -eq 0x52 -and $b[1] -eq 0x49 -and $b[2] -eq 0x46 -and $b[3] -eq 0x46) { return '.webp' }
+
+        # ISO base media format: bytes 4..7 are 'ftyp', then a 4-char brand.
+        $tag = [Text.Encoding]::ASCII.GetString($b, 4, 8)
+        if ($tag.StartsWith('ftyp')) {
+            $brand = $tag.Substring(4, 4).ToLowerInvariant()
+            if ($brand -match '^(heic|heix|heim|heis|hevc|hevx|mif1|msf1)') { return '.heic' }
+            if ($brand -match '^avif') { return '.avif' }
+            if ($brand -match '^qt')   { return '.mov' }
+            return '.mp4'
+        }
+        return ''
+    } catch { return '' }
+}
+
 function Get-MediaKind {
     param([string]$Ext)
     $e = $Ext.ToLowerInvariant()
