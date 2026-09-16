@@ -46,6 +46,7 @@ $LogDir         = Join-Path $script:Root 'logs'
 $StageDir       = Join-Path $script:Root '.staging'
 $IndexPath      = Join-Path $StateDir 'index.tsv'
 $CatalogPath    = Join-Path $StateDir 'catalog.jsonl'
+$FailuresPath   = Join-Path $StateDir 'failures.tsv'
 $StatusPath     = Join-Path $StateDir 'status.json'
 $PauseFlag      = Join-Path $StateDir 'pause.flag'
 $StopFlag       = Join-Path $StateDir 'stop.flag'
@@ -269,12 +270,45 @@ function Resolve-StagedFile {
     return $null
 }
 
+function Get-StageBytes {
+    # Total bytes sitting in staging - our proxy for "the shell is still working".
+    try {
+        $sum = 0
+        foreach ($f in [IO.Directory]::EnumerateFiles($StageDir)) {
+            $sum += (New-Object IO.FileInfo $f).Length
+        }
+        return [long]$sum
+    } catch { return [long]-1 }
+}
+
 function Wait-ForStagedFile {
-    # Returns the resolved path once the file has fully landed, else $null.
-    param([string]$StageDir, [string]$Name, [long]$ExpectedSize, [int]$TimeoutSec = 240)
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    $lastLen  = -1
-    $stable   = 0
+    <#
+        Returns the resolved path once the file has fully landed, else $null.
+
+        Some items never transfer at all - typically photos that are not fully
+        resident on the device (iCloud-optimised), where the phone tries to fetch
+        from iCloud and the copy silently stalls. Waiting the full timeout on each
+        of those wasted 4 minutes per file, which on a large library adds hours.
+
+        So we fail fast on *no activity anywhere*: if our file has not appeared
+        AND nothing in staging has grown for $NoProgressSec, the shell has stopped
+        delivering and further waiting is pointless. A file that is actually
+        arriving keeps resetting the stall timer, so genuinely large videos are
+        still given the full $TimeoutSec.
+    #>
+    param(
+        [string]$StageDir,
+        [string]$Name,
+        [long]$ExpectedSize,
+        [int]$TimeoutSec     = 240,
+        [int]$NoProgressSec  = 45
+    )
+    $deadline   = (Get-Date).AddSeconds($TimeoutSec)
+    $lastLen    = -1
+    $stable     = 0
+    $lastGlobal = Get-StageBytes
+    $lastChange = Get-Date
+
     while ((Get-Date) -lt $deadline) {
         $p = Resolve-StagedFile -StageDir $StageDir -Name $Name
         if ($p) {
@@ -282,10 +316,16 @@ function Wait-ForStagedFile {
             if ($len -eq $lastLen -and ($ExpectedSize -le 0 -or $len -eq $ExpectedSize)) {
                 $stable++
                 if ($stable -ge 2) { return $p }
-            } else { $stable = 0 }
+            } else { $stable = 0; $lastChange = Get-Date }
             $lastLen = $len
+        } else {
+            $now = Get-StageBytes
+            if ($now -ne $lastGlobal) { $lastGlobal = $now; $lastChange = Get-Date }
+            elseif (((Get-Date) - $lastChange).TotalSeconds -ge $NoProgressSec) {
+                return $null   # nothing is moving; stop burning the clock
+            }
         }
-        Start-Sleep -Milliseconds 150
+        Start-Sleep -Milliseconds 200
     }
     return $null
 }
@@ -488,24 +528,80 @@ try {
                 catch { Write-Log ("  CopyHere failed for {0}: {1}" -f $e.Name, $_.Exception.Message) 'WARN' }
             }
 
+            # Drain the chunk in WHATEVER ORDER files actually arrive.
+            #
+            # Waiting on each item in slice order meant one stuck file (typically
+            # an item not fully resident on the device) blocked up to 24 others
+            # that had already landed, for the full timeout, on every chunk.
             $chunkTimeouts = 0
-            foreach ($e in $slice) {
-                Set-Status @{ CurrentFile = $e.Name; Album = $e.Album }
-                $sp = Wait-ForStagedFile -StageDir $StageDir -Name $e.Name -ExpectedSize $e.Size
-                if ($sp) {
-                    $r = Complete-StagedFile -StagedPath $sp -Key $e.Key -ExpectedSize $e.Size -Album $e.Album
-                    if ($null -ne $r) {
-                        $copied++; $bytes += $r; [void]$index.Add($e.Key)
-                    } else { $failed++ }
-                } else {
-                    Write-Log ("  timed out copying {0} - will retry next run." -f $e.Name) 'WARN'
-                    $failed++; $chunkTimeouts++
-                    $orphan = Resolve-StagedFile -StageDir $StageDir -Name $e.Name
-                    if ($orphan) { Remove-Item -LiteralPath $orphan -Force -ErrorAction SilentlyContinue }
+            $pending = New-Object System.Collections.ArrayList
+            foreach ($e in $slice) { [void]$pending.Add($e) }
+            $seenLen       = @{}
+            $chunkDeadline = (Get-Date).AddSeconds(240)
+            $lastStage     = Get-StageBytes
+            $lastChange    = Get-Date
+
+            while ($pending.Count -gt 0 -and (Get-Date) -lt $chunkDeadline) {
+                if (Test-StopRequested) { break }
+                # Check pause inside the drain, not just between chunks - otherwise
+                # pressing Pause could take the full chunk timeout to take effect.
+                if (Test-Path -LiteralPath $PauseFlag) {
+                    $pausedAt = Get-Date
+                    Wait-WhilePaused
+                    if (Test-StopRequested) { break }
+                    # Do not count time spent paused against the chunk's deadline.
+                    $chunkDeadline = $chunkDeadline.AddSeconds(((Get-Date) - $pausedAt).TotalSeconds)
+                    $lastChange    = Get-Date
                 }
-                Set-Status @{ Done = $copied; Failed = $failed; Bytes = $bytes
-                              CurrentDate = $script:LastBucket }
+                $settled = New-Object System.Collections.ArrayList
+
+                foreach ($e in $pending) {
+                    $p = Resolve-StagedFile -StageDir $StageDir -Name $e.Name
+                    if (-not $p) { continue }
+                    $len = (Get-Item -LiteralPath $p).Length
+
+                    if ($e.Size -gt 0) {
+                        if ($len -ne $e.Size) { continue }          # still being written
+                    } else {
+                        # Unknown expected size: accept once it stops growing.
+                        if ($len -le 0 -or $seenLen[$e.Key] -ne $len) { $seenLen[$e.Key] = $len; continue }
+                    }
+
+                    Set-Status @{ CurrentFile = $e.Name; Album = $e.Album }
+                    $r = Complete-StagedFile -StagedPath $p -Key $e.Key -ExpectedSize $e.Size -Album $e.Album
+                    if ($null -ne $r) { $copied++; $bytes += $r; [void]$index.Add($e.Key) }
+                    else { $failed++ }
+                    [void]$settled.Add($e)
+                }
+
+                foreach ($e in $settled) { $pending.Remove($e) }
+
+                if ($settled.Count -gt 0) {
+                    $lastChange = Get-Date
+                    Set-Status @{ Done = $copied; Failed = $failed; Bytes = $bytes
+                                  CurrentDate = $script:LastBucket }
+                } else {
+                    $now = Get-StageBytes
+                    if ($now -ne $lastStage) { $lastStage = $now; $lastChange = Get-Date }
+                    elseif (((Get-Date) - $lastChange).TotalSeconds -ge 45) { break }
+                    Start-Sleep -Milliseconds 250
+                }
             }
+
+            # Anything still pending never made it across.
+            foreach ($e in $pending) {
+                Write-Log ("  did not transfer: {0} ({1}) - will retry next run." -f $e.Name, $e.Album) 'WARN'
+                $failed++; $chunkTimeouts++
+                # Keep an auditable list so "did I get everything?" is answerable.
+                try {
+                    Add-Content -LiteralPath $FailuresPath -Encoding UTF8 -Value (
+                        "{0}`t{1}`t{2}`t{3}" -f (Get-Date -Format s), $e.Album, $e.Name, $e.Size)
+                } catch { }
+                $orphan = Resolve-StagedFile -StageDir $StageDir -Name $e.Name
+                if ($orphan) { Remove-Item -LiteralPath $orphan -Force -ErrorAction SilentlyContinue }
+            }
+            Set-Status @{ Done = $copied; Failed = $failed; Bytes = $bytes
+                          CurrentDate = $script:LastBucket } -Force
 
             # --- throughput + ETA over a rolling window ---------------------
             [void]$rateSamples.Add([pscustomobject]@{ T = (Get-Date); B = $bytes })
@@ -555,6 +651,15 @@ elseif ($stoppedEarly) { $verb = 'Stopped by you' }
 $result = '{0}: {1:N0} new, {2:N0} already had, {3} failed, {4:N1} GB in {5:hh\:mm\:ss}' -f `
     $verb, $copied, $skipped, $failed, ($bytes / 1GB), $sw.Elapsed
 Write-Log ("RESULT: " + $result) 'OK'
+
+# Completeness check: say plainly whether the phone's camera roll is fully here.
+$outstanding = $work.Count - $copied
+if ($failed -gt 0 -or $outstanding -gt 0) {
+    Write-Log ("INCOMPLETE: {0:N0} item(s) on the phone are still not in the library." -f [Math]::Max($failed, $outstanding)) 'WARN'
+    Write-Log ("            Reconnect to retry them. Persistent failures are listed in {0}" -f $FailuresPath) 'WARN'
+} elseif (-not $stoppedEarly -and -not $disconnected) {
+    Write-Log 'COMPLETE: every item the phone exposed is now in the library.' 'OK'
+}
 
 Set-Status @{ State = 'Idle'; Phase = $verb; CurrentFile = ''; LastResult = $result
               EtaSeconds = -1; BytesPerSec = 0
