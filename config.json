@@ -1,14 +1,16 @@
-{
-  "LibraryPath":       "%USERPROFILE%/Desktop/iPhone Photos/Library",
-  "BackupPath":        "E:/Backups/iPhone Photos",
-  "MirrorDeletes":     false,
-  "OrganizeByDate":    true,
-  "DeviceNamePattern": "iPhone|iPad|Apple",
-  "PollSeconds":       8,
-  "UnlockWaitSeconds": 300,
-  "ChunkSize":         25,
-  "CaptureMetadata":   true,
-  "HashFiles":         true,
-  "Notify":            true,
-  "LogRetentionDays":  30
+﻿{
+    "LibraryPath":  "%USERPROFILE%/Desktop/iPhone Photos/Library",
+    "BackupPath":  "E:/Backups/iPhone Photos",
+    "MirrorDeletes":  false,
+    "OrganizeByDate":  true,
+    "DeviceNamePattern":  "iPhone|iPad|Apple",
+    "PollSeconds":  8,
+    "UnlockWaitSeconds":  300,
+    "ChunkSize":  25,
+    "CaptureMetadata":  true,
+    "HashFiles":  true,
+    "Notify":  true,
+    "LogRetentionDays":  30,
+    "StallSeconds":  300,
+    "MaxAutoRestarts":  5
 }

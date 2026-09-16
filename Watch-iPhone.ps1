@@ -23,6 +23,18 @@ foreach ($d in @($LogDir, $StateDir)) {
 }
 $WatchLog   = Join-Path $LogDir 'watcher.log'
 $DevicePath = Join-Path $StateDir 'device.json'
+$StatusPath = Join-Path $StateDir 'status.json'
+
+# Watchdog thresholds (overridable in config.json).
+$StallSeconds    = 300
+$MaxAutoRestarts = 5
+if ($cfg.PSObject.Properties.Name -contains 'StallSeconds' -and [int]$cfg.StallSeconds -gt 0) {
+    $StallSeconds = [int]$cfg.StallSeconds
+}
+if ($cfg.PSObject.Properties.Name -contains 'MaxAutoRestarts') {
+    $MaxAutoRestarts = [int]$cfg.MaxAutoRestarts
+}
+$script:Restarts = 0
 
 function Write-DeviceState {
     param([bool]$Present, [string]$Name)
@@ -92,6 +104,9 @@ while ($true) {
         if ($present -and -not $wasPresent) {
             Write-WLog 'Device connected.'
             $syncedThis = $false
+            # Fresh connection: allow the full restart budget again, otherwise a
+            # few wedges in one session would disable recovery permanently.
+            $script:Restarts = 0
         }
         elseif (-not $present -and $wasPresent) {
             Write-WLog 'Device disconnected.'
@@ -102,6 +117,38 @@ while ($true) {
         if ($script:SyncProc -and $script:SyncProc.HasExited) {
             Write-WLog ('Sync finished (exit {0}).' -f $script:SyncProc.ExitCode)
             $script:SyncProc = $null
+        }
+
+        # --- watchdog -------------------------------------------------------
+        # An MTP session can wedge permanently: the sync blocks inside a COM call
+        # that never returns, so it stops copying, stops logging, and cannot even
+        # honour Pause or Stop because it never reaches the check. Nothing was
+        # watching for that, so a transfer could sit dead for hours.
+        # If a sync claims to be running but has not published status for a while,
+        # kill it. The index makes restarting free - it resumes where it stopped.
+        if (Test-Path -LiteralPath $StatusPath) {
+            try {
+                $st = Get-Content -LiteralPath $StatusPath -Raw | ConvertFrom-Json
+                $active = @('Starting','Waiting','Scanning','Copying','Stopping') -contains $st.State
+                if ($active -and $st.Pid) {
+                    $age = ((Get-Date).ToUniversalTime() - [datetime]::Parse($st.UpdatedUtc).ToUniversalTime()).TotalSeconds
+                    if ($age -gt $StallSeconds) {
+                        $victim = Get-Process -Id $st.Pid -ErrorAction SilentlyContinue
+                        if ($victim) {
+                            Write-WLog ("Sync pid {0} wedged - no status for {1}s. Killing it." -f $st.Pid, [int]$age)
+                            Stop-Process -Id $st.Pid -Force -ErrorAction SilentlyContinue
+                            $script:SyncProc = $null
+                            if ($script:Restarts -lt $MaxAutoRestarts) {
+                                $script:Restarts++
+                                $syncedThis = $false   # let the loop start a fresh one
+                                Write-WLog ("Will restart it (attempt {0} of {1})." -f $script:Restarts, $MaxAutoRestarts)
+                            } else {
+                                Write-WLog "Restart limit reached; unplug and replug to try again."
+                            }
+                        }
+                    }
+                }
+            } catch { }
         }
 
         if ($present -and -not $syncedThis) {

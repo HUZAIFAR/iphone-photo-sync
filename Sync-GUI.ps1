@@ -479,6 +479,18 @@ $timer.Add_Tick({
         if (-not $procAlive) { $running = $false; $state = 'Idle' }
     }
 
+    # A wedged MTP session leaves the process alive but blocked inside a COM call
+    # that never returns: it stops publishing status and cannot honour Pause or
+    # Stop, because it never gets back to check them. Showing a cheerful
+    # "Importing..." then makes the buttons look broken. Say what is true.
+    $script:Stalled = $false
+    if ($running -and $st -and $st.UpdatedUtc) {
+        try {
+            $statusAge = ((Get-Date).ToUniversalTime() - [datetime]::Parse($st.UpdatedUtc).ToUniversalTime()).TotalSeconds
+            if ($statusAge -gt 90) { $script:Stalled = $true }
+        } catch { }
+    }
+
     # connection dot + name
     if ($present) {
         $ctl.Dot.Fill = $brushGreen
@@ -512,10 +524,16 @@ $timer.Add_Tick({
         }
         $ctl.VEta.Text = if ($running) { Format-Duration ([int]$st.EtaSeconds) } else { [string][char]0x2014 }
 
-        $ctl.BigStatus.Text  = [string]$st.Phase
-        $ctl.StatusLine.Text = if ($running) { 'Do not unplug - or do; it resumes where it left off.' }
-                               elseif ($st.LastResult) { [string]$st.LastResult }
-                               else { 'Idle' }
+        if ($script:Stalled) {
+            $ctl.BigStatus.Text  = 'Not responding'
+            $ctl.StatusLine.Text = 'The phone stopped responding mid-transfer. Pause and Stop cannot ' +
+                                   'work while it is wedged - it recovers by itself, or replug the cable.'
+        } else {
+            $ctl.BigStatus.Text  = [string]$st.Phase
+            $ctl.StatusLine.Text = if ($running) { 'Do not unplug - or do; it resumes where it left off.' }
+                                   elseif ($st.LastResult) { [string]$st.LastResult }
+                                   else { 'Idle' }
+        }
 
         if ($total -gt 0) {
             $p = [Math]::Min(100, [Math]::Round(($done / [double]$total) * 100, 1))
@@ -542,7 +560,11 @@ $timer.Add_Tick({
     }
 
     # paused / stopped visual state
-    if ($state -eq 'Paused') {
+    if ($script:Stalled) {
+        $ctl.Bar.Foreground   = $brushAmber
+        $ctl.Pct.Foreground   = $brushAmber
+        $ctl.BtnPause.Content = 'Pause'
+    } elseif ($state -eq 'Paused') {
         $ctl.Bar.Foreground   = $brushAmber
         $ctl.Pct.Foreground   = $brushAmber
         $ctl.BtnPause.Content = 'Resume'
@@ -555,8 +577,9 @@ $timer.Add_Tick({
         $ctl.BtnPause.Content = 'Pause'
     }
 
-    $ctl.BtnPause.IsEnabled = $running
-    $ctl.BtnStop.IsEnabled  = $running -and -not (Test-Path -LiteralPath $StopFlag)
+    # Grey these out while wedged rather than letting them look ignored.
+    $ctl.BtnPause.IsEnabled = $running -and -not $script:Stalled
+    $ctl.BtnStop.IsEnabled  = $running -and -not $script:Stalled -and -not (Test-Path -LiteralPath $StopFlag)
     $ctl.BtnSync.IsEnabled  = -not $running
 
     # ---- log tail every 2s ----
